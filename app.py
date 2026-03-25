@@ -1,7 +1,6 @@
 import os
 import time
 import threading
-import math
 import base64
 from datetime import datetime, timezone
 
@@ -29,12 +28,32 @@ ALPACA_SECRET = os.environ.get("ALPACA_SECRET_KEY", "")
 ALPACA_DATA = "https://data.alpaca.markets"
 ALPACA_CLOCK = "https://paper-api.alpaca.markets/v2/clock"
 
-# IMPORTANT:
-# foloseste doar simboluri US compatibile cu Alpaca Stocks data feed
+# Simboluri default, curate, potrivite pentru bot
 SUPPORTED_DEFAULT_SYMBOLS = [
     "AAPL", "NVDA", "MSFT", "SPY", "QQQ",
     "TSLA", "AMZN", "META", "GOOGL", "JPM"
 ]
+
+# Lista mai larga de simboluri pe care le permiti in bot
+ALLOWED_SYMBOLS = {
+    "AAPL", "NVDA", "MSFT", "SPY", "QQQ",
+    "TSLA", "AMZN", "META", "GOOGL", "JPM",
+    "AMD", "NFLX", "PLTR", "AVGO", "INTC",
+    "CRM", "ORCL", "ADBE", "BAC", "XOM",
+    "COST", "WMT", "MU", "SHOP", "UBER",
+    "PANW", "SNOW", "AMAT", "LRCX", "GE",
+    "V", "MA", "KO", "PEP", "DIS"
+}
+
+# Lista preferata pentru regim 24/5, adica ce vrei sa prioritizezi
+PREFERRED_24_5_SYMBOLS = {
+    "AAPL", "NVDA", "MSFT", "SPY", "QQQ",
+    "TSLA", "AMZN", "META", "GOOGL", "JPM",
+    "AMD", "NFLX", "PLTR", "AVGO"
+}
+
+# Daca True, botul accepta doar simboluri din lista preferata 24/5
+ONLY_PREFERRED_24_5 = os.environ.get("ONLY_PREFERRED_24_5", "true").lower() == "true"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # State
@@ -53,6 +72,7 @@ state = {
     "last_scan": None,
     "market": "closed",
     "regime": "unknown",
+    "symbol_mode": "preferred_24_5" if ONLY_PREFERRED_24_5 else "allowed",
 }
 
 settings = {
@@ -63,6 +83,7 @@ settings = {
     "rr_ratio": 3.0,
     "max_positions": 3,
     "scan_interval": 300,
+    "only_preferred_24_5": ONLY_PREFERRED_24_5,
 }
 
 bot_thread = None
@@ -134,15 +155,54 @@ def safe_int(value, default=0):
 def clean_closed_positions():
     if len(state["positions"]) <= 200:
         return
+
     open_positions = [p for p in state["positions"] if p.get("status") == "open"]
     closed_positions = [p for p in state["positions"] if p.get("status") != "open"]
     closed_positions = closed_positions[-150:]
     state["positions"] = open_positions + closed_positions
 
 
-def normalize_symbols(raw_symbols):
+def get_symbol_universe(preferred_only=None):
+    if preferred_only is None:
+        preferred_only = bool(settings.get("only_preferred_24_5", ONLY_PREFERRED_24_5))
+    return PREFERRED_24_5_SYMBOLS if preferred_only else ALLOWED_SYMBOLS
+
+
+def filter_tradeable_symbols(symbols, preferred_only=None):
+    universe = get_symbol_universe(preferred_only)
+
+    if not isinstance(symbols, list):
+        fallback = [s for s in SUPPORTED_DEFAULT_SYMBOLS if s in universe]
+        return fallback if fallback else SUPPORTED_DEFAULT_SYMBOLS.copy()
+
+    valid = []
+    blocked = []
+
+    for raw in symbols:
+        sym = str(raw or "").strip().upper()
+        if not sym:
+            continue
+
+        if sym in universe:
+            if sym not in valid:
+                valid.append(sym)
+        else:
+            blocked.append(sym)
+
+    if blocked:
+        mode_label = "preferred 24/5" if (preferred_only if preferred_only is not None else settings.get("only_preferred_24_5", ONLY_PREFERRED_24_5)) else "allowed"
+        add_log(f"Simboluri respinse ({mode_label}): {', '.join(blocked)}", "warn")
+
+    if valid:
+        return valid[:30]
+
+    fallback = [s for s in SUPPORTED_DEFAULT_SYMBOLS if s in universe]
+    return fallback if fallback else SUPPORTED_DEFAULT_SYMBOLS.copy()
+
+
+def normalize_symbols(raw_symbols, preferred_only=None):
     if not isinstance(raw_symbols, list):
-        return SUPPORTED_DEFAULT_SYMBOLS.copy()
+        return filter_tradeable_symbols(SUPPORTED_DEFAULT_SYMBOLS.copy(), preferred_only)
 
     cleaned = []
     for s in raw_symbols:
@@ -153,15 +213,14 @@ def normalize_symbols(raw_symbols):
             continue
         cleaned.append(sym)
 
-    # elimina duplicatele pastrand ordinea
     seen = set()
-    result = []
+    deduped = []
     for s in cleaned:
         if s not in seen:
             seen.add(s)
-            result.append(s)
+            deduped.append(s)
 
-    return result[:30] if result else SUPPORTED_DEFAULT_SYMBOLS.copy()
+    return filter_tradeable_symbols(deduped[:30], preferred_only)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -238,10 +297,7 @@ def t212_get(endpoint, params=None, use_cache=True, retries=2):
                     if wait_s <= 0:
                         wait_s = 6.0
 
-                    add_log(
-                        f"T212 GET {endpoint}: 429 Too Many Requests, astept {wait_s:.1f}s",
-                        "warn",
-                    )
+                    add_log(f"T212 GET {endpoint}: 429 Too Many Requests, astept {wait_s:.1f}s", "warn")
 
                     if attempt < retries:
                         time.sleep(wait_s)
@@ -285,10 +341,7 @@ def t212_post(endpoint, body, retries=1):
                     if wait_s <= 0:
                         wait_s = 6.0
 
-                    add_log(
-                        f"T212 POST {endpoint}: 429 Too Many Requests, astept {wait_s:.1f}s",
-                        "warn",
-                    )
+                    add_log(f"T212 POST {endpoint}: 429 Too Many Requests, astept {wait_s:.1f}s", "warn")
 
                     if attempt < retries:
                         time.sleep(wait_s)
@@ -342,10 +395,7 @@ def t212_delete(endpoint, retries=1):
                     if wait_s <= 0:
                         wait_s = 6.0
 
-                    add_log(
-                        f"T212 DELETE {endpoint}: 429 Too Many Requests, astept {wait_s:.1f}s",
-                        "warn",
-                    )
+                    add_log(f"T212 DELETE {endpoint}: 429 Too Many Requests, astept {wait_s:.1f}s", "warn")
 
                     if attempt < retries:
                         time.sleep(wait_s)
@@ -418,7 +468,6 @@ def get_price(symbol):
 
         if ask > 0 and bid > 0:
             return (ask + bid) / 2.0, bid, ask
-
         if ask > 0:
             return ask, bid if bid > 0 else ask, ask
         if bid > 0:
@@ -956,7 +1005,14 @@ def refresh_balance(force=False):
 def bot_loop():
     global start_balance
 
-    add_log("Bot Stocks T212 pornit — Paper Trading", "ok")
+    preferred_only = bool(settings.get("only_preferred_24_5", ONLY_PREFERRED_24_5))
+    settings["symbols"] = filter_tradeable_symbols(settings["symbols"], preferred_only)
+    state["symbol_mode"] = "preferred_24_5" if preferred_only else "allowed"
+
+    add_log(
+        f"Bot Stocks T212 pornit — mod simboluri: {'preferred 24/5' if preferred_only else 'allowed'}",
+        "ok",
+    )
 
     if not refresh_balance(force=True):
         add_log("Nu pot obtine balanta T212 — verifica API keys.", "err")
@@ -964,6 +1020,7 @@ def bot_loop():
         return
 
     add_log(f"Balanta T212: ${state['balance']:,.2f}", "ok")
+    add_log(f"Simboluri active: {', '.join(settings['symbols'])}", "info")
 
     last_balance_refresh = 0.0
 
@@ -1068,6 +1125,9 @@ def api_status():
             "last_scan": state["last_scan"],
             "market": state["market"],
             "regime": state["regime"],
+            "symbol_mode": state["symbol_mode"],
+            "preferred_24_5_symbols": sorted(PREFERRED_24_5_SYMBOLS),
+            "allowed_symbols": sorted(ALLOWED_SYMBOLS),
             "settings": settings,
         }
     )
@@ -1120,8 +1180,15 @@ def api_stop():
 def api_settings():
     data = request.get_json() or {}
 
+    preferred_only = settings.get("only_preferred_24_5", ONLY_PREFERRED_24_5)
+    if "only_preferred_24_5" in data:
+        preferred_only = bool(data.get("only_preferred_24_5"))
+        settings["only_preferred_24_5"] = preferred_only
+        state["symbol_mode"] = "preferred_24_5" if preferred_only else "allowed"
+
     if "symbols" in data:
-        settings["symbols"] = normalize_symbols(data["symbols"])
+        settings["symbols"] = normalize_symbols(data["symbols"], preferred_only)
+        add_log(f"Simboluri active: {', '.join(settings['symbols'])}", "info")
 
     if "risk_pct" in data:
         settings["risk_pct"] = max(0.1, safe_float(data["risk_pct"], settings["risk_pct"]))
@@ -1141,7 +1208,13 @@ def api_settings():
     if "scan_interval" in data:
         settings["scan_interval"] = max(5, safe_int(data["scan_interval"], settings["scan_interval"]))
 
-    add_log("Setari actualizate.", "info")
+    settings["symbols"] = filter_tradeable_symbols(settings["symbols"], preferred_only)
+
+    add_log(
+        f"Setari actualizate. Mod simboluri: {'preferred 24/5' if preferred_only else 'allowed'}",
+        "info",
+    )
+
     return jsonify({"ok": True, "settings": settings})
 
 
