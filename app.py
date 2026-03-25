@@ -1,766 +1,1150 @@
-<!DOCTYPE html>
-<html lang="ro">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>T212 Stocks Bot</title>
-  <style>
-    :root{
-      --bg:#090d14;
-      --panel:#121826;
-      --panel-2:#171f31;
-      --line:#283148;
-      --text:#dbe6ff;
-      --muted:#8d9ab6;
-      --green:#22c55e;
-      --red:#ef4444;
-      --amber:#f59e0b;
-      --blue:#60a5fa;
-      --cyan:#22d3ee;
-      --violet:#8b5cf6;
-      --card-radius:18px;
+import os
+import time
+import threading
+import math
+import base64
+from datetime import datetime, timezone
+
+import requests
+from flask import Flask, jsonify, request, send_from_directory
+from flask_cors import CORS
+
+app = Flask(__name__, static_folder="static")
+CORS(app)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Config
+# ──────────────────────────────────────────────────────────────────────────────
+T212_KEY = os.environ.get("T212_API_KEY", "")
+T212_SECRET = os.environ.get("T212_API_SECRET", "")
+T212_DEMO = os.environ.get("T212_DEMO", "true").lower() == "true"
+T212_BASE = (
+    "https://demo.trading212.com/api/v0"
+    if T212_DEMO
+    else "https://live.trading212.com/api/v0"
+)
+
+ALPACA_KEY = os.environ.get("ALPACA_KEY_ID", "")
+ALPACA_SECRET = os.environ.get("ALPACA_SECRET_KEY", "")
+ALPACA_DATA = "https://data.alpaca.markets"
+ALPACA_CLOCK = "https://paper-api.alpaca.markets/v2/clock"
+
+# IMPORTANT:
+# foloseste doar simboluri US compatibile cu Alpaca Stocks data feed
+SUPPORTED_DEFAULT_SYMBOLS = [
+    "AAPL", "NVDA", "MSFT", "SPY", "QQQ",
+    "TSLA", "AMZN", "META", "GOOGL", "JPM"
+]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# State
+# ──────────────────────────────────────────────────────────────────────────────
+state = {
+    "running": False,
+    "balance": 0.0,
+    "pnl": 0.0,
+    "daily_dd": 0.0,
+    "wins": 0,
+    "losses": 0,
+    "positions": [],
+    "history": [],
+    "log": [],
+    "scan_count": 0,
+    "last_scan": None,
+    "market": "closed",
+    "regime": "unknown",
+}
+
+settings = {
+    "symbols": SUPPORTED_DEFAULT_SYMBOLS.copy(),
+    "risk_pct": 1.0,
+    "dd_limit": 5.0,
+    "sl_pct": 1.5,
+    "rr_ratio": 3.0,
+    "max_positions": 3,
+    "scan_interval": 300,
+}
+
+bot_thread = None
+start_balance = 0.0
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Sessions
+# ──────────────────────────────────────────────────────────────────────────────
+t212_session = requests.Session()
+alpaca_session = requests.Session()
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Rate limit / cache Trading 212
+# ──────────────────────────────────────────────────────────────────────────────
+t212_lock = threading.Lock()
+
+T212_RATE_LIMITS = {
+    "/equity/account/summary": 5.2,
+    "/equity/portfolio": 1.2,
+    "/equity/orders": 5.2,
+    "/equity/orders/market": 1.2,
+}
+
+t212_last_call = {}
+t212_cache = {}
+
+T212_CACHE_TTL = {
+    "/equity/account/summary": 15.0,
+    "/equity/portfolio": 3.0,
+    "/equity/orders": 5.0,
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Logging
+# ──────────────────────────────────────────────────────────────────────────────
+def add_log(msg, level="info"):
+    entry = {
+        "time": datetime.utcnow().strftime("%H:%M:%S"),
+        "msg": str(msg),
+        "level": level,
+    }
+    state["log"].insert(0, entry)
+    if len(state["log"]) > 300:
+        state["log"] = state["log"][:300]
+    print(f"[{entry['time']}] [{level.upper()}] {msg}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+def safe_float(value, default=0.0):
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def safe_int(value, default=0):
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except Exception:
+        return default
+
+
+def clean_closed_positions():
+    if len(state["positions"]) <= 200:
+        return
+    open_positions = [p for p in state["positions"] if p.get("status") == "open"]
+    closed_positions = [p for p in state["positions"] if p.get("status") != "open"]
+    closed_positions = closed_positions[-150:]
+    state["positions"] = open_positions + closed_positions
+
+
+def normalize_symbols(raw_symbols):
+    if not isinstance(raw_symbols, list):
+        return SUPPORTED_DEFAULT_SYMBOLS.copy()
+
+    cleaned = []
+    for s in raw_symbols:
+        if s is None:
+            continue
+        sym = str(s).strip().upper()
+        if not sym:
+            continue
+        cleaned.append(sym)
+
+    # elimina duplicatele pastrand ordinea
+    seen = set()
+    result = []
+    for s in cleaned:
+        if s not in seen:
+            seen.add(s)
+            result.append(s)
+
+    return result[:30] if result else SUPPORTED_DEFAULT_SYMBOLS.copy()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Trading 212 API
+# ──────────────────────────────────────────────────────────────────────────────
+def t212_headers():
+    creds = base64.b64encode(f"{T212_KEY}:{T212_SECRET}".encode()).decode()
+    return {
+        "Authorization": f"Basic {creds}",
+        "Content-Type": "application/json",
     }
 
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-      background: linear-gradient(180deg, #0a0f17 0%, #08101a 100%);
-      color: var(--text);
-    }
 
-    .wrap {
-      max-width: 1600px;
-      margin: 0 auto;
-      padding: 24px;
-    }
+def _t212_wait_for_rate_limit(endpoint):
+    min_wait = T212_RATE_LIMITS.get(endpoint, 1.0)
+    now = time.time()
+    last = t212_last_call.get(endpoint, 0.0)
+    wait_s = min_wait - (now - last)
+    if wait_s > 0:
+        time.sleep(wait_s)
 
-    .topbar {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 16px;
-      margin-bottom: 22px;
-      flex-wrap: wrap;
-    }
 
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 14px;
-      font-weight: 700;
-      letter-spacing: .04em;
-    }
+def _t212_get_cache(endpoint):
+    ttl = T212_CACHE_TTL.get(endpoint)
+    if ttl is None:
+        return None
 
-    .pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      padding: 8px 14px;
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      background: rgba(255,255,255,.03);
-      color: var(--muted);
-      font-size: 13px;
-    }
+    cached = t212_cache.get(endpoint)
+    if not cached:
+        return None
 
-    .dot {
-      width: 10px;
-      height: 10px;
-      border-radius: 50%;
-      background: var(--muted);
-    }
+    age = time.time() - cached["ts"]
+    if age <= ttl:
+        return cached["data"]
 
-    .dot.green { background: var(--green); }
-    .dot.red { background: var(--red); }
-    .dot.amber { background: var(--amber); }
+    return None
 
-    .grid {
-      display: grid;
-      grid-template-columns: 330px 1fr;
-      gap: 20px;
-    }
 
-    .panel {
-      background: linear-gradient(180deg, rgba(22,29,46,.95), rgba(18,24,38,.98));
-      border: 1px solid var(--line);
-      border-radius: var(--card-radius);
-      padding: 18px;
-      box-shadow: 0 10px 30px rgba(0,0,0,.18);
-    }
-
-    .sidebar h3,
-    .section-title {
-      margin: 0 0 14px;
-      color: var(--muted);
-      font-size: 13px;
-      letter-spacing: .08em;
-      text-transform: uppercase;
-    }
-
-    .stats {
-      display: grid;
-      grid-template-columns: repeat(4, minmax(0,1fr));
-      gap: 16px;
-      margin-bottom: 20px;
-    }
-
-    .stat {
-      background: rgba(255,255,255,.02);
-      border: 1px solid var(--line);
-      border-radius: 18px;
-      padding: 18px;
-      min-height: 118px;
-    }
-
-    .stat .label {
-      color: var(--muted);
-      font-size: 13px;
-      text-transform: uppercase;
-      letter-spacing: .07em;
-      margin-bottom: 8px;
-    }
-
-    .stat .value {
-      font-size: 22px;
-      font-weight: 800;
-      margin-bottom: 6px;
-    }
-
-    .stat .sub {
-      color: var(--muted);
-      font-size: 13px;
-    }
-
-    .green { color: var(--green); }
-    .red { color: var(--red); }
-    .amber { color: var(--amber); }
-    .blue { color: var(--blue); }
-
-    .symbols-grid {
-      display: grid;
-      grid-template-columns: repeat(2, 1fr);
-      gap: 10px;
-      margin-bottom: 18px;
-    }
-
-    .symbol-chip {
-      border: 1px solid #4d5ec9;
-      color: #9fb0ff;
-      background: rgba(105,126,255,.08);
-      border-radius: 12px;
-      padding: 12px 10px;
-      text-align: center;
-      font-weight: 700;
-      font-size: 14px;
-    }
-
-    .field {
-      margin-bottom: 14px;
-    }
-
-    .field label {
-      display: block;
-      color: var(--muted);
-      font-size: 13px;
-      margin-bottom: 6px;
-      text-transform: uppercase;
-      letter-spacing: .05em;
-    }
-
-    .field input,
-    .field textarea {
-      width: 100%;
-      border: 1px solid var(--line);
-      background: #0c1321;
-      color: var(--text);
-      border-radius: 12px;
-      padding: 12px 14px;
-      outline: none;
-      font-size: 14px;
-    }
-
-    .field textarea {
-      min-height: 88px;
-      resize: vertical;
-    }
-
-    .btns {
-      display: flex;
-      gap: 10px;
-      margin-top: 12px;
-      flex-wrap: wrap;
-    }
-
-    button {
-      border: 0;
-      border-radius: 12px;
-      padding: 12px 16px;
-      font-weight: 700;
-      cursor: pointer;
-      color: white;
-    }
-
-    .btn-start { background: var(--green); }
-    .btn-stop { background: var(--red); }
-    .btn-save { background: var(--blue); }
-
-    .main-grid {
-      display: grid;
-      grid-template-columns: 1.1fr .9fr;
-      gap: 20px;
-      margin-bottom: 20px;
-    }
-
-    .chart-placeholder {
-      height: 280px;
-      border: 1px solid var(--line);
-      border-radius: 16px;
-      background:
-        linear-gradient(to bottom, rgba(255,255,255,.02), rgba(255,255,255,.01)),
-        repeating-linear-gradient(
-          to bottom,
-          transparent 0,
-          transparent 34px,
-          rgba(255,255,255,.04) 35px
-        );
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      color: var(--muted);
-      font-size: 14px;
-    }
-
-    .log-box {
-      height: 280px;
-      overflow: auto;
-      border: 1px solid var(--line);
-      border-radius: 16px;
-      background: #0a101b;
-      padding: 12px;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      font-size: 13px;
-      line-height: 1.55;
-    }
-
-    .log-row {
-      padding: 4px 0;
-      border-bottom: 1px solid rgba(255,255,255,.03);
-      word-break: break-word;
-    }
-
-    .log-time {
-      color: #90a4d4;
-      margin-right: 8px;
-    }
-
-    .log-info { color: var(--blue); }
-    .log-warn { color: var(--amber); }
-    .log-err  { color: var(--red); }
-    .log-ok   { color: var(--green); }
-
-    .tables {
-      display: grid;
-      grid-template-columns: 1fr;
-      gap: 20px;
-    }
-
-    .table-wrap {
-      overflow: auto;
-      border: 1px solid var(--line);
-      border-radius: 16px;
-      background: #0b1220;
-    }
-
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      min-width: 900px;
-    }
-
-    th, td {
-      padding: 12px 14px;
-      border-bottom: 1px solid rgba(255,255,255,.05);
-      text-align: left;
-      font-size: 14px;
-    }
-
-    th {
-      color: var(--muted);
-      text-transform: uppercase;
-      letter-spacing: .06em;
-      font-size: 12px;
-      background: rgba(255,255,255,.02);
-    }
-
-    .small {
-      font-size: 12px;
-      color: var(--muted);
-    }
-
-    .top-right {
-      display: flex;
-      gap: 10px;
-      align-items: center;
-      flex-wrap: wrap;
-    }
-
-    .muted { color: var(--muted); }
-
-    @media (max-width: 1180px) {
-      .grid {
-        grid-template-columns: 1fr;
-      }
-      .stats {
-        grid-template-columns: repeat(2, minmax(0,1fr));
-      }
-      .main-grid {
-        grid-template-columns: 1fr;
-      }
-    }
-
-    @media (max-width: 720px) {
-      .stats {
-        grid-template-columns: 1fr;
-      }
-      .symbols-grid {
-        grid-template-columns: repeat(2, 1fr);
-      }
-      .wrap {
-        padding: 14px;
-      }
-    }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="topbar">
-      <div class="brand">
-        <div style="font-size:22px;">T212/STOCKS/BOT</div>
-        <div id="statusPill" class="pill">
-          <span id="statusDot" class="dot red"></span>
-          <span id="statusText">Oprit</span>
-        </div>
-        <div id="demoPill" class="pill">PAPER</div>
-        <div id="marketPill" class="pill">
-          <span id="marketDot" class="dot amber"></span>
-          <span id="marketText">Market Unknown</span>
-        </div>
-        <div id="regimePill" class="pill">Regim: unknown</div>
-      </div>
-
-      <div class="top-right">
-        <div class="pill">Scan: <span id="scanCount" style="margin-left:6px;">0</span></div>
-        <div class="pill">Last scan: <span id="lastScan" style="margin-left:6px;">—</span></div>
-      </div>
-    </div>
-
-    <div class="grid">
-      <div class="sidebar panel">
-        <h3>Simboluri active</h3>
-        <div id="symbolsGrid" class="symbols-grid"></div>
-
-        <div class="field">
-          <label>Simboluri, separate prin virgula</label>
-          <textarea id="symbolsInput">AAPL,NVDA,MSFT,SPY,QQQ,TSLA,AMZN,META,GOOGL,JPM</textarea>
-        </div>
-
-        <div class="field">
-          <label>Risc per trade (%)</label>
-          <input id="riskPct" type="number" step="0.1" min="0.1" value="1" />
-        </div>
-
-        <div class="field">
-          <label>SL % de la entry</label>
-          <input id="slPct" type="number" step="0.1" min="0.1" value="1.5" />
-        </div>
-
-        <div class="field">
-          <label>RR ratio (1:X)</label>
-          <input id="rrRatio" type="number" step="0.1" min="0.5" value="3" />
-        </div>
-
-        <div class="field">
-          <label>Drawdown max (%)</label>
-          <input id="ddLimit" type="number" step="0.1" min="0.5" value="5" />
-        </div>
-
-        <div class="field">
-          <label>Max pozitii simultan</label>
-          <input id="maxPositions" type="number" step="1" min="1" value="3" />
-        </div>
-
-        <div class="field">
-          <label>Scan interval (sec)</label>
-          <input id="scanInterval" type="number" step="1" min="5" value="300" />
-        </div>
-
-        <div class="btns">
-          <button class="btn-save" onclick="saveSettings()">Salveaza setari</button>
-          <button class="btn-start" onclick="startBot()">Start bot</button>
-          <button class="btn-stop" onclick="stopBot()">Stop bot</button>
-        </div>
-      </div>
-
-      <div>
-        <div class="stats">
-          <div class="stat">
-            <div class="label">Balanta T212</div>
-            <div class="value" id="balanceVal">$0.00</div>
-            <div class="sub" id="demoText">Paper USD</div>
-          </div>
-
-          <div class="stat">
-            <div class="label">P&L realizat</div>
-            <div class="value" id="pnlVal">$0.00</div>
-            <div class="sub" id="pnlPctVal">0.00%</div>
-          </div>
-
-          <div class="stat">
-            <div class="label">P&L live</div>
-            <div class="value" id="livePnlVal">$0.00</div>
-            <div class="sub"><span id="activePosCount">0</span> pozitii active</div>
-          </div>
-
-          <div class="stat">
-            <div class="label">Win rate</div>
-            <div class="value" id="winRateVal">0%</div>
-            <div class="sub"><span id="winsVal">0</span>W / <span id="lossesVal">0</span>L</div>
-          </div>
-        </div>
-
-        <div class="main-grid">
-          <div class="panel">
-            <div class="section-title">P&L cumulativ</div>
-            <div class="chart-placeholder">
-              Grafic placeholder. Daca vrei, dupa asta iti fac si chart real din history.
-            </div>
-          </div>
-
-          <div class="panel">
-            <div class="section-title">Log bot</div>
-            <div id="logBox" class="log-box"></div>
-          </div>
-        </div>
-
-        <div class="tables">
-          <div class="panel">
-            <div class="section-title">Pozitii deschise / inchise</div>
-            <div class="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Simbol</th>
-                    <th>Dir</th>
-                    <th>Entry</th>
-                    <th>Mark</th>
-                    <th>SL</th>
-                    <th>TP</th>
-                    <th>Shares</th>
-                    <th>P&L Live</th>
-                    <th>Status</th>
-                    <th>Motiv</th>
-                    <th>Open Time</th>
-                  </tr>
-                </thead>
-                <tbody id="positionsBody"></tbody>
-              </table>
-            </div>
-          </div>
-
-          <div class="panel">
-            <div class="section-title">Trade history</div>
-            <div class="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Date</th>
-                    <th>Simbol</th>
-                    <th>Dir</th>
-                    <th>Entry</th>
-                    <th>Exit</th>
-                    <th>Shares</th>
-                    <th>P&L</th>
-                    <th>RR</th>
-                    <th>Motiv</th>
-                  </tr>
-                </thead>
-                <tbody id="historyBody"></tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <script>
-    const el = id => document.getElementById(id);
-
-    function fmtMoney(v) {
-      const n = Number(v || 0);
-      const sign = n > 0 ? "+" : "";
-      return `${sign}$${n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-    }
-
-    function fmtNum(v, d = 2) {
-      const n = Number(v || 0);
-      return n.toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d });
-    }
-
-    function setText(id, value) {
-      const node = el(id);
-      if (node) node.textContent = value;
-    }
-
-    function setMoney(id, value) {
-      const node = el(id);
-      if (!node) return;
-      node.textContent = fmtMoney(value);
-      node.classList.remove("green", "red", "amber");
-      const n = Number(value || 0);
-      if (n > 0) node.classList.add("green");
-      else if (n < 0) node.classList.add("red");
-    }
-
-    function renderSymbols(symbols) {
-      const grid = el("symbolsGrid");
-      grid.innerHTML = "";
-      (symbols || []).forEach(sym => {
-        const div = document.createElement("div");
-        div.className = "symbol-chip";
-        div.textContent = sym;
-        grid.appendChild(div);
-      });
-    }
-
-    function renderLog(logs) {
-      const box = el("logBox");
-      box.innerHTML = "";
-      (logs || []).forEach(row => {
-        const div = document.createElement("div");
-        div.className = `log-row log-${row.level || "info"}`;
-        div.innerHTML = `<span class="log-time">${row.time}</span>${escapeHtml(row.msg || "")}`;
-        box.appendChild(div);
-      });
-    }
-
-    function renderPositions(rows) {
-      const body = el("positionsBody");
-      body.innerHTML = "";
-
-      if (!rows || rows.length === 0) {
-        body.innerHTML = `<tr><td colspan="11" class="muted">Nu exista pozitii.</td></tr>`;
-        return;
-      }
-
-      rows.forEach(p => {
-        const tr = document.createElement("tr");
-        const pnl = Number(p.pnl_live || 0);
-        const pnlClass = pnl > 0 ? "green" : pnl < 0 ? "red" : "";
-        const dirClass = p.direction === "LONG" ? "green" : "red";
-
-        tr.innerHTML = `
-          <td>${escapeHtml(p.symbol || "")}</td>
-          <td class="${dirClass}">${escapeHtml(p.direction || "")}</td>
-          <td>${fmtNum(p.entry, 4)}</td>
-          <td>${fmtNum(p.mark_price, 4)}</td>
-          <td>${fmtNum(p.sl, 4)}</td>
-          <td>${fmtNum(p.tp, 4)}</td>
-          <td>${fmtNum(p.shares, 2)}</td>
-          <td class="${pnlClass}">${fmtMoney(pnl)}</td>
-          <td>${escapeHtml(p.status || "")}</td>
-          <td>${escapeHtml(p.reason || "")}</td>
-          <td>${escapeHtml(p.open_time || "-")}</td>
-        `;
-        body.appendChild(tr);
-      });
-    }
-
-    function renderHistory(rows) {
-      const body = el("historyBody");
-      body.innerHTML = "";
-
-      if (!rows || rows.length === 0) {
-        body.innerHTML = `<tr><td colspan="9" class="muted">Nu exista istoric.</td></tr>`;
-        return;
-      }
-
-      rows.forEach(p => {
-        const tr = document.createElement("tr");
-        const pnl = Number(p.pnl || 0);
-        const pnlClass = pnl > 0 ? "green" : pnl < 0 ? "red" : "";
-        const dirClass = p.dir === "LONG" ? "green" : "red";
-
-        tr.innerHTML = `
-          <td>${escapeHtml(p.date || "")}</td>
-          <td>${escapeHtml(p.symbol || "")}</td>
-          <td class="${dirClass}">${escapeHtml(p.dir || "")}</td>
-          <td>${fmtNum(p.entry, 4)}</td>
-          <td>${fmtNum(p.exit, 4)}</td>
-          <td>${fmtNum(p.shares, 2)}</td>
-          <td class="${pnlClass}">${fmtMoney(pnl)}</td>
-          <td>${escapeHtml(p.rr || "")}</td>
-          <td>${escapeHtml(p.reason || "")}</td>
-        `;
-        body.appendChild(tr);
-      });
-    }
-
-    function escapeHtml(str) {
-      return String(str)
-        .replaceAll("&", "&amp;")
-        .replaceAll("<", "&lt;")
-        .replaceAll(">", "&gt;")
-        .replaceAll('"', "&quot;")
-        .replaceAll("'", "&#039;");
-    }
-
-    async function fetchJSON(url, options = {}) {
-      const res = await fetch(url, options);
-      return await res.json();
-    }
-
-    async function refreshStatus() {
-      try {
-        const s = await fetchJSON("/api/status");
-
-        setMoney("balanceVal", s.balance);
-        setMoney("pnlVal", s.pnl);
-        setMoney("livePnlVal", s.live_pnl);
-        setText("pnlPctVal", `${fmtNum(s.pnl_pct, 2)}%`);
-        setText("activePosCount", s.active_positions || 0);
-        setText("winRateVal", `${fmtNum(s.win_rate, 1)}%`);
-        setText("winsVal", s.wins || 0);
-        setText("lossesVal", s.losses || 0);
-        setText("scanCount", s.scan_count || 0);
-        setText("lastScan", s.last_scan || "—");
-        setText("demoText", s.demo ? "Paper USD" : "Live USD");
-
-        const running = !!s.running;
-        el("statusText").textContent = running ? "Activ" : "Oprit";
-        el("statusDot").className = `dot ${running ? "green" : "red"}`;
-
-        const market = String(s.market || "unknown").toLowerCase();
-        let marketColor = "amber";
-        if (market === "open") marketColor = "green";
-        if (market === "closed" || market === "weekend") marketColor = "red";
-
-        el("marketDot").className = `dot ${marketColor}`;
-        el("marketText").textContent = market.toUpperCase();
-
-        el("regimePill").textContent = `Regim: ${s.regime || "unknown"}`;
-
-        if (s.settings) {
-          const symbols = s.settings.symbols || [];
-          renderSymbols(symbols);
-          el("symbolsInput").value = symbols.join(", ");
-          el("riskPct").value = s.settings.risk_pct ?? 1;
-          el("slPct").value = s.settings.sl_pct ?? 1.5;
-          el("rrRatio").value = s.settings.rr_ratio ?? 3;
-          el("ddLimit").value = s.settings.dd_limit ?? 5;
-          el("maxPositions").value = s.settings.max_positions ?? 3;
-          el("scanInterval").value = s.settings.scan_interval ?? 300;
-        }
-      } catch (e) {
-        console.error("Status error", e);
-      }
-    }
-
-    async function refreshPositions() {
-      try {
-        const rows = await fetchJSON("/api/positions");
-        renderPositions(rows);
-      } catch (e) {
-        console.error("Positions error", e);
-      }
-    }
-
-    async function refreshHistory() {
-      try {
-        const rows = await fetchJSON("/api/history");
-        renderHistory(rows);
-      } catch (e) {
-        console.error("History error", e);
-      }
-    }
-
-    async function refreshLog() {
-      try {
-        const logs = await fetchJSON("/api/log");
-        renderLog(logs);
-      } catch (e) {
-        console.error("Log error", e);
-      }
-    }
-
-    async function startBot() {
-      try {
-        const data = await fetchJSON("/api/start", { method: "POST" });
-        if (!data.ok) alert(data.msg || "Nu am putut porni botul");
-        await refreshAll();
-      } catch (e) {
-        alert("Eroare la start");
-      }
-    }
-
-    async function stopBot() {
-      try {
-        await fetchJSON("/api/stop", { method: "POST" });
-        await refreshAll();
-      } catch (e) {
-        alert("Eroare la stop");
-      }
-    }
-
-    async function saveSettings() {
-      try {
-        const symbols = el("symbolsInput").value
-          .split(",")
-          .map(s => s.trim().toUpperCase())
-          .filter(Boolean);
-
-        const payload = {
-          symbols,
-          risk_pct: parseFloat(el("riskPct").value || "1"),
-          sl_pct: parseFloat(el("slPct").value || "1.5"),
-          rr_ratio: parseFloat(el("rrRatio").value || "3"),
-          dd_limit: parseFloat(el("ddLimit").value || "5"),
-          max_positions: parseInt(el("maxPositions").value || "3", 10),
-          scan_interval: parseInt(el("scanInterval").value || "300", 10),
-        };
-
-        const data = await fetchJSON("/api/settings", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
-        });
-
-        if (!data.ok) {
-          alert("Nu am putut salva setarile");
-          return;
+def _t212_set_cache(endpoint, data):
+    if endpoint in T212_CACHE_TTL:
+        t212_cache[endpoint] = {
+            "ts": time.time(),
+            "data": data,
         }
 
-        await refreshAll();
-      } catch (e) {
-        alert("Eroare la salvarea setarilor");
-      }
+
+def _t212_invalidate_cache(*endpoints):
+    for ep in endpoints:
+        t212_cache.pop(ep, None)
+
+
+def t212_get(endpoint, params=None, use_cache=True, retries=2):
+    with t212_lock:
+        if use_cache:
+            cached = _t212_get_cache(endpoint)
+            if cached is not None:
+                return cached
+
+        for attempt in range(retries + 1):
+            try:
+                _t212_wait_for_rate_limit(endpoint)
+
+                r = t212_session.get(
+                    f"{T212_BASE}{endpoint}",
+                    headers=t212_headers(),
+                    params=params,
+                    timeout=10,
+                )
+                t212_last_call[endpoint] = time.time()
+
+                if r.status_code == 429:
+                    retry_after = r.headers.get("Retry-After")
+                    wait_s = safe_float(retry_after, 6.0)
+                    if wait_s <= 0:
+                        wait_s = 6.0
+
+                    add_log(
+                        f"T212 GET {endpoint}: 429 Too Many Requests, astept {wait_s:.1f}s",
+                        "warn",
+                    )
+
+                    if attempt < retries:
+                        time.sleep(wait_s)
+                        continue
+
+                    return None
+
+                r.raise_for_status()
+                data = r.json()
+                _t212_set_cache(endpoint, data)
+                return data
+
+            except Exception as e:
+                if attempt < retries:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+
+                add_log(f"T212 GET {endpoint}: {e}", "err")
+                return None
+
+    return None
+
+
+def t212_post(endpoint, body, retries=1):
+    with t212_lock:
+        for attempt in range(retries + 1):
+            try:
+                _t212_wait_for_rate_limit(endpoint)
+
+                r = t212_session.post(
+                    f"{T212_BASE}{endpoint}",
+                    headers=t212_headers(),
+                    json=body,
+                    timeout=10,
+                )
+                t212_last_call[endpoint] = time.time()
+
+                if r.status_code == 429:
+                    retry_after = r.headers.get("Retry-After")
+                    wait_s = safe_float(retry_after, 6.0)
+                    if wait_s <= 0:
+                        wait_s = 6.0
+
+                    add_log(
+                        f"T212 POST {endpoint}: 429 Too Many Requests, astept {wait_s:.1f}s",
+                        "warn",
+                    )
+
+                    if attempt < retries:
+                        time.sleep(wait_s)
+                        continue
+
+                    return None
+
+                r.raise_for_status()
+
+                _t212_invalidate_cache(
+                    "/equity/account/summary",
+                    "/equity/portfolio",
+                    "/equity/orders",
+                )
+
+                if r.content:
+                    try:
+                        return r.json()
+                    except Exception:
+                        return {"ok": True}
+
+                return {"ok": True}
+
+            except Exception as e:
+                if attempt < retries:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+
+                add_log(f"T212 POST {endpoint}: {e}", "err")
+                return None
+
+    return None
+
+
+def t212_delete(endpoint, retries=1):
+    with t212_lock:
+        for attempt in range(retries + 1):
+            try:
+                _t212_wait_for_rate_limit(endpoint)
+
+                r = t212_session.delete(
+                    f"{T212_BASE}{endpoint}",
+                    headers=t212_headers(),
+                    timeout=10,
+                )
+                t212_last_call[endpoint] = time.time()
+
+                if r.status_code == 429:
+                    retry_after = r.headers.get("Retry-After")
+                    wait_s = safe_float(retry_after, 6.0)
+                    if wait_s <= 0:
+                        wait_s = 6.0
+
+                    add_log(
+                        f"T212 DELETE {endpoint}: 429 Too Many Requests, astept {wait_s:.1f}s",
+                        "warn",
+                    )
+
+                    if attempt < retries:
+                        time.sleep(wait_s)
+                        continue
+
+                    return False
+
+                r.raise_for_status()
+
+                _t212_invalidate_cache(
+                    "/equity/account/summary",
+                    "/equity/portfolio",
+                    "/equity/orders",
+                )
+
+                return True
+
+            except Exception as e:
+                if attempt < retries:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+
+                add_log(f"T212 DELETE {endpoint}: {e}", "err")
+                return False
+
+    return False
+
+
+def get_account(force=False):
+    return t212_get("/equity/account/summary", use_cache=not force)
+
+
+def get_portfolio(force=False):
+    return t212_get("/equity/portfolio", use_cache=not force)
+
+
+def get_open_orders(force=False):
+    data = t212_get("/equity/orders", use_cache=not force)
+    return data if isinstance(data, list) else []
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Alpaca Market Data
+# ──────────────────────────────────────────────────────────────────────────────
+def alpaca_headers():
+    return {
+        "APCA-API-KEY-ID": ALPACA_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET,
     }
 
-    async function refreshAll() {
-      await Promise.all([
-        refreshStatus(),
-        refreshPositions(),
-        refreshHistory(),
-        refreshLog()
-      ]);
+
+def get_price(symbol):
+    try:
+        r = alpaca_session.get(
+            f"{ALPACA_DATA}/v2/stocks/{symbol}/quotes/latest",
+            headers=alpaca_headers(),
+            params={"feed": "iex"},
+            timeout=8,
+        )
+        r.raise_for_status()
+
+        data = r.json()
+        quote = data.get("quote")
+        if not isinstance(quote, dict):
+            add_log(f"Price {symbol}: quote lipsa sau invalid", "warn")
+            return None, None, None
+
+        ask = safe_float(quote.get("ap"), 0.0)
+        bid = safe_float(quote.get("bp"), 0.0)
+
+        if ask > 0 and bid > 0:
+            return (ask + bid) / 2.0, bid, ask
+
+        if ask > 0:
+            return ask, bid if bid > 0 else ask, ask
+        if bid > 0:
+            return bid, bid, ask if ask > 0 else bid
+
+        add_log(f"Price {symbol}: bid/ask invalide", "warn")
+        return None, None, None
+
+    except Exception as e:
+        add_log(f"Price {symbol}: {e}", "warn")
+        return None, None, None
+
+
+def get_bars(symbol, timeframe="1Hour", limit=80):
+    try:
+        r = alpaca_session.get(
+            f"{ALPACA_DATA}/v2/stocks/{symbol}/bars",
+            headers=alpaca_headers(),
+            params={
+                "timeframe": timeframe,
+                "limit": limit,
+                "feed": "iex",
+                "adjustment": "raw",
+            },
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+
+        raw_bars = data.get("bars")
+        if not isinstance(raw_bars, list):
+            add_log(f"Bars {symbol}: raspuns invalid de la Alpaca", "warn")
+            return []
+
+        cleaned = []
+        for b in raw_bars:
+            if not isinstance(b, dict):
+                continue
+
+            cleaned.append(
+                {
+                    "o": safe_float(b.get("o")),
+                    "h": safe_float(b.get("h")),
+                    "l": safe_float(b.get("l")),
+                    "c": safe_float(b.get("c")),
+                    "v": safe_int(b.get("v"), 0),
+                    "t": b.get("t"),
+                }
+            )
+
+        if not cleaned:
+            add_log(f"Bars {symbol}: fara date pe {timeframe}", "warn")
+
+        return cleaned
+
+    except Exception as e:
+        add_log(f"Bars {symbol}: {e}", "warn")
+        return []
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Market Hours
+# ──────────────────────────────────────────────────────────────────────────────
+def get_market_status():
+    try:
+        r = alpaca_session.get(
+            ALPACA_CLOCK,
+            headers=alpaca_headers(),
+            timeout=5,
+        )
+        r.raise_for_status()
+        d = r.json()
+        is_open = bool(d.get("is_open", False))
+        state["market"] = "open" if is_open else "closed"
+        return is_open
+    except Exception:
+        pass
+
+    now = datetime.now(timezone.utc)
+    if now.weekday() >= 5:
+        state["market"] = "weekend"
+        return False
+
+    h = now.hour + now.minute / 60.0
+    is_open = 13.5 <= h < 20.0
+    state["market"] = "open" if is_open else "closed"
+    return is_open
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ICT Strategy
+# ──────────────────────────────────────────────────────────────────────────────
+def calc_ema(closes, n):
+    if not isinstance(closes, list) or len(closes) < n:
+        return None
+
+    k = 2 / (n + 1)
+    e = closes[0]
+    for c in closes[1:]:
+        e = c * k + e * (1 - k)
+    return e
+
+
+def calc_atr(bars, n=14):
+    if not isinstance(bars, list) or len(bars) < n + 1:
+        return None
+
+    trs = []
+    for i in range(1, len(bars)):
+        tr = max(
+            bars[i]["h"] - bars[i]["l"],
+            abs(bars[i]["h"] - bars[i - 1]["c"]),
+            abs(bars[i]["l"] - bars[i - 1]["c"]),
+        )
+        trs.append(tr)
+
+    return sum(trs[-n:]) / n if len(trs) >= n else None
+
+
+def detect_regime(bars):
+    period = 14
+    mult = 1.5
+
+    if not isinstance(bars, list) or len(bars) < period * 2 + 1:
+        return "unknown"
+
+    atr_now = calc_atr(bars[-(period + 1):], period)
+    atr_avg = calc_atr(bars[-(period * 2 + 1):-period], period)
+
+    if not atr_now or not atr_avg or atr_avg == 0:
+        return "unknown"
+
+    return "trending" if atr_now > atr_avg * mult else "ranging"
+
+
+def detect_htf_bias(bars_d):
+    if not isinstance(bars_d, list) or len(bars_d) < 50:
+        return None
+
+    closes = [b["c"] for b in bars_d]
+    ema = calc_ema(closes[-50:], 50)
+    if ema is None:
+        return None
+
+    return "BULLISH" if closes[-1] > ema else "BEARISH"
+
+
+def detect_fvg(bars):
+    if not isinstance(bars, list) or len(bars) < 3:
+        return None
+
+    for i in range(len(bars) - 1, max(1, len(bars) - 20), -1):
+        if i < 2:
+            continue
+
+        c1, c3 = bars[i - 2], bars[i]
+
+        if c1["h"] < c3["l"]:
+            return {"type": "BULLISH", "mid": (c1["h"] + c3["l"]) / 2.0}
+
+        if c1["l"] > c3["h"]:
+            return {"type": "BEARISH", "mid": (c1["l"] + c3["h"]) / 2.0}
+
+        body = abs(c3["c"] - c3["o"])
+        overlap = c1["h"] - c3["l"]
+        if body > 0 and 0 < overlap < body * 0.4:
+            return {
+                "type": "BULLISH" if c3["c"] > c3["o"] else "BEARISH",
+                "mid": (c1["h"] + c3["l"]) / 2.0,
+            }
+
+    return None
+
+
+def detect_sweep(bars):
+    if not isinstance(bars, list) or len(bars) < 12:
+        return None
+
+    for i in range(len(bars) - 1, max(10, len(bars) - 9), -1):
+        recent = bars[max(0, i - 10):i]
+        last = bars[i]
+        if not recent:
+            continue
+
+        sh = max(b["h"] for b in recent)
+        sl = min(b["l"] for b in recent)
+
+        if last["l"] < sl and last["c"] > sl:
+            return "BULLISH_SWEEP"
+        if last["h"] > sh and last["c"] < sh:
+            return "BEARISH_SWEEP"
+
+    return None
+
+
+def detect_ema_cross(bars):
+    if not isinstance(bars, list) or len(bars) < 15:
+        return None
+
+    closes = [b["c"] for b in bars]
+
+    efn = calc_ema(closes[-5:], 5)
+    esn = calc_ema(closes[-13:], 13)
+    efp = calc_ema(closes[-6:-1], 5)
+    esp = calc_ema(closes[-14:-1], 13)
+
+    if None in (efn, esn, efp, esp):
+        return None
+
+    if efp <= esp and efn > esn:
+        return "BULLISH_CROSS"
+    if efp >= esp and efn < esn:
+        return "BEARISH_CROSS"
+
+    return None
+
+
+def detect_momentum(bars, n=2):
+    if not isinstance(bars, list) or len(bars) < n:
+        return None
+
+    last_n = bars[-n:]
+    if all(b["c"] > b["o"] for b in last_n):
+        return "BULLISH_MOM"
+    if all(b["c"] < b["o"] for b in last_n):
+        return "BEARISH_MOM"
+
+    return None
+
+
+def detect_rsi(bars, period=14):
+    if not isinstance(bars, list) or len(bars) < period + 2:
+        return None
+
+    closes = [b["c"] for b in bars[-(period + 2):]]
+    gains = [max(closes[i] - closes[i - 1], 0) for i in range(1, len(closes))]
+    losses = [max(closes[i - 1] - closes[i], 0) for i in range(1, len(closes))]
+
+    ag = sum(gains[-period:]) / period
+    al = sum(losses[-period:]) / period
+
+    if al == 0:
+        return None
+
+    rsi = 100 - 100 / (1 + ag / al)
+
+    if rsi < 30:
+        return "BULLISH_OVERSOLD"
+    if rsi > 70:
+        return "BEARISH_OVERBOUGHT"
+
+    return None
+
+
+def ict_scan(symbol):
+    bars_1h = get_bars(symbol, "1Hour", 80)
+    bars_1d = get_bars(symbol, "1Day", 60)
+
+    if not isinstance(bars_1h, list) or not isinstance(bars_1d, list):
+        add_log(f"Scan {symbol}: bars invalide", "warn")
+        return None
+
+    if len(bars_1h) == 0 or len(bars_1d) == 0:
+        add_log(f"Scan {symbol}: fara suficiente date", "warn")
+        return None
+
+    bias = detect_htf_bias(bars_1d)
+    regime = detect_regime(bars_1h)
+    state["regime"] = regime
+
+    if not bias:
+        return None
+
+    if regime in ("trending", "unknown"):
+        fvg = detect_fvg(bars_1h)
+        sw = detect_sweep(bars_1h)
+        ema = detect_ema_cross(bars_1h)
+        mom = detect_momentum(bars_1h)
+
+        if bias == "BULLISH":
+            if fvg and fvg["type"] == "BULLISH":
+                return ("LONG", f"FVG {fvg['mid']:.2f}", regime)
+            if sw == "BULLISH_SWEEP":
+                return ("LONG", "Liq.Sweep", regime)
+            if ema == "BULLISH_CROSS":
+                return ("LONG", "EMA Cross", regime)
+            if mom == "BULLISH_MOM":
+                return ("LONG", "Momentum", regime)
+
+        if bias == "BEARISH":
+            if fvg and fvg["type"] == "BEARISH":
+                return ("SHORT", f"FVG {fvg['mid']:.2f}", regime)
+            if sw == "BEARISH_SWEEP":
+                return ("SHORT", "Liq.Sweep", regime)
+            if ema == "BEARISH_CROSS":
+                return ("SHORT", "EMA Cross", regime)
+            if mom == "BEARISH_MOM":
+                return ("SHORT", "Momentum", regime)
+
+    elif regime == "ranging":
+        rsi = detect_rsi(bars_1h)
+        if rsi == "BULLISH_OVERSOLD" and bias == "BULLISH":
+            return ("LONG", "RSI<30", regime)
+        if rsi == "BEARISH_OVERBOUGHT" and bias == "BEARISH":
+            return ("SHORT", "RSI>70", regime)
+
+    return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Execution
+# ──────────────────────────────────────────────────────────────────────────────
+def build_t212_ticker(symbol):
+    return f"{symbol}_US_EQ"
+
+
+def open_trade(symbol, direction, reason):
+    mid, bid, ask = get_price(symbol)
+    if not mid:
+        add_log(f"Nu am pret pentru {symbol}", "err")
+        return
+
+    price = ask if direction == "LONG" else bid
+    if not price or price <= 0:
+        add_log(f"Pret invalid pentru {symbol}", "err")
+        return
+
+    balance = state["balance"]
+    risk_usd = balance * (settings["risk_pct"] / 100.0)
+    sl_pct = settings["sl_pct"] / 100.0
+    tp_pct = sl_pct * settings["rr_ratio"]
+
+    sl = price * (1 - sl_pct) if direction == "LONG" else price * (1 + sl_pct)
+    tp = price * (1 + tp_pct) if direction == "LONG" else price * (1 - tp_pct)
+
+    sl_dist = abs(price - sl)
+    if sl_dist <= 0:
+        add_log(f"SL invalid pentru {symbol}", "err")
+        return
+
+    shares = risk_usd / sl_dist
+    shares = round(shares, 2)
+
+    if shares <= 0:
+        add_log(f"Size invalid pentru {symbol}: {shares}", "err")
+        return
+
+    max_notional = balance * 0.4
+    notional = shares * price
+    if notional > max_notional:
+        shares = round(max_notional / price, 2)
+
+    if shares <= 0:
+        add_log(f"Size recalculat invalid pentru {symbol}: {shares}", "err")
+        return
+
+    qty = shares if direction == "LONG" else -shares
+    ticker = build_t212_ticker(symbol)
+
+    result = t212_post(
+        "/equity/orders/market",
+        {
+            "ticker": ticker,
+            "quantity": qty,
+        },
+    )
+
+    if not result or "id" not in result:
+        add_log(f"Ordin respins {symbol}: {result}", "err")
+        return
+
+    pos = {
+        "id": str(result["id"]),
+        "symbol": symbol,
+        "ticker": ticker,
+        "direction": direction,
+        "entry": round(price, 4),
+        "mark_price": round(price, 4),
+        "sl": round(sl, 4),
+        "tp": round(tp, 4),
+        "shares": shares,
+        "pnl_live": 0.0,
+        "status": "open",
+        "open_time": datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
+        "reason": reason,
+        "regime": state.get("regime", "unknown"),
     }
 
-    refreshAll();
-    setInterval(refreshStatus, 3000);
-    setInterval(refreshPositions, 4000);
-    setInterval(refreshHistory, 5000);
-    setInterval(refreshLog, 2500);
-  </script>
-</body>
-</html>
+    state["positions"].append(pos)
+    add_log(
+        f"{direction} {symbol} @ ${price:.2f} | SL:${sl:.2f} TP:${tp:.2f} | {shares} shares | {reason}",
+        "ok",
+    )
+
+
+def close_trade(pos, reason):
+    mid, bid, ask = get_price(pos["symbol"])
+    exit_price = mid or pos.get("mark_price") or pos["entry"]
+
+    qty = -pos["shares"] if pos["direction"] == "LONG" else pos["shares"]
+    result = t212_post(
+        "/equity/orders/market",
+        {
+            "ticker": pos["ticker"],
+            "quantity": qty,
+        },
+    )
+
+    if not result or "id" not in result:
+        add_log(f"Eroare inchidere {pos['symbol']}: {result}", "err")
+        return
+
+    pnl = (
+        (exit_price - pos["entry"]) * pos["shares"]
+        if pos["direction"] == "LONG"
+        else (pos["entry"] - exit_price) * pos["shares"]
+    )
+
+    pos["status"] = "closed"
+    pos["close_time"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+    pos["mark_price"] = round(exit_price, 4)
+    pos["pnl_live"] = round(pnl, 2)
+
+    state["pnl"] += pnl
+
+    if pnl > 0:
+        state["wins"] += 1
+    else:
+        state["losses"] += 1
+        state["daily_dd"] += abs(pnl) / max(state["balance"], 1) * 100.0
+
+    sl_dist = abs(pos["entry"] - pos["sl"])
+    rr_value = abs((exit_price - pos["entry"]) / sl_dist) if sl_dist > 0 else 0
+    rr = f"1:{rr_value:.1f}" if sl_dist > 0 else "—"
+
+    state["history"].append(
+        {
+            "date": datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
+            "symbol": pos["symbol"],
+            "dir": pos["direction"],
+            "entry": pos["entry"],
+            "exit": round(exit_price, 4),
+            "shares": pos["shares"],
+            "pnl": round(pnl, 2),
+            "rr": rr,
+            "reason": reason,
+        }
+    )
+
+    add_log(
+        f"{pos['symbol']} {reason} | ${pnl:+.2f} | {rr}",
+        "ok" if pnl > 0 else "err",
+    )
+
+    if state["daily_dd"] >= settings["dd_limit"]:
+        add_log(f"Daily DD {state['daily_dd']:.2f}% atins. Bot oprit.", "err")
+        state["running"] = False
+
+    clean_closed_positions()
+
+
+def sync_positions():
+    portfolio = get_portfolio()
+    if not portfolio:
+        return
+
+    portfolio_map = {}
+
+    if isinstance(portfolio, list):
+        for p in portfolio:
+            if isinstance(p, dict):
+                portfolio_map[p.get("ticker", "")] = p
+    elif isinstance(portfolio, dict):
+        for p in portfolio.get("items", []):
+            if isinstance(p, dict):
+                portfolio_map[p.get("ticker", "")] = p
+
+    for pos in state["positions"]:
+        if pos.get("status") != "open":
+            continue
+
+        live = portfolio_map.get(pos["ticker"])
+        if live:
+            current_price = safe_float(live.get("currentPrice"), pos["entry"])
+            ppl = safe_float(live.get("ppl"), 0.0)
+
+            pos["mark_price"] = current_price
+            pos["pnl_live"] = ppl
+
+            hit_sl = (
+                pos["direction"] == "LONG" and current_price <= pos["sl"]
+            ) or (
+                pos["direction"] == "SHORT" and current_price >= pos["sl"]
+            )
+
+            hit_tp = (
+                pos["direction"] == "LONG" and current_price >= pos["tp"]
+            ) or (
+                pos["direction"] == "SHORT" and current_price <= pos["tp"]
+            )
+
+            if hit_tp:
+                add_log(f"TP atins {pos['symbol']} @ ${current_price:.2f}", "warn")
+                close_trade(pos, "TP hit")
+            elif hit_sl:
+                add_log(f"SL atins {pos['symbol']} @ ${current_price:.2f}", "warn")
+                close_trade(pos, "SL hit")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Bot loop
+# ──────────────────────────────────────────────────────────────────────────────
+def refresh_balance(force=False):
+    global start_balance
+
+    acc = get_account(force=force)
+    if not acc:
+        return False
+
+    cash = acc.get("cash", {}) if isinstance(acc, dict) else {}
+    bal = safe_float(cash.get("availableToTrade"), 0.0)
+
+    if bal <= 0:
+        bal = safe_float(acc.get("totalValue"), state["balance"])
+
+    if bal > 0:
+        state["balance"] = bal
+        if start_balance <= 0:
+            start_balance = bal
+        return True
+
+    return False
+
+
+def bot_loop():
+    global start_balance
+
+    add_log("Bot Stocks T212 pornit — Paper Trading", "ok")
+
+    if not refresh_balance(force=True):
+        add_log("Nu pot obtine balanta T212 — verifica API keys.", "err")
+        state["running"] = False
+        return
+
+    add_log(f"Balanta T212: ${state['balance']:,.2f}", "ok")
+
+    last_balance_refresh = 0.0
+
+    while state["running"]:
+        try:
+            state["scan_count"] += 1
+            state["last_scan"] = datetime.utcnow().strftime("%H:%M:%S")
+
+            sync_positions()
+
+            now = time.time()
+            if now - last_balance_refresh >= 15:
+                refresh_balance(force=False)
+                last_balance_refresh = now
+
+            is_open = get_market_status()
+
+            add_log(
+                f"Scan #{state['scan_count']} | Piata: {'DESCHISA' if is_open else 'INCHISA'} | {state['market'].upper()}"
+            )
+
+            if not is_open:
+                add_log("Piata inchisa — astept NYSE open.", "warn")
+            else:
+                open_count = len([p for p in state["positions"] if p.get("status") == "open"])
+
+                if open_count >= settings["max_positions"]:
+                    add_log(f"Max {settings['max_positions']} pozitii active. Astept exit.", "warn")
+                else:
+                    for symbol in settings["symbols"]:
+                        if not state["running"]:
+                            break
+
+                        if any(
+                            p.get("status") == "open" and p.get("symbol") == symbol
+                            for p in state["positions"]
+                        ):
+                            continue
+
+                        add_log(f"Scanez {symbol}...", "info")
+
+                        try:
+                            sig = ict_scan(symbol)
+                        except Exception as e:
+                            add_log(f"Scan {symbol}: {e}", "err")
+                            continue
+
+                        if sig:
+                            direction, reason, regime = sig
+                            add_log(f"{symbol}: {direction} — {reason} [{regime}]", "warn")
+                            open_trade(symbol, direction, reason)
+
+                            open_count = len([p for p in state["positions"] if p.get("status") == "open"])
+                            if open_count >= settings["max_positions"]:
+                                break
+
+                        time.sleep(1.5)
+
+        except Exception as e:
+            add_log(f"Eroare in bot_loop: {e}", "err")
+
+        interval = safe_int(settings.get("scan_interval", 300), 300)
+        if interval < 5:
+            interval = 5
+
+        for _ in range(interval):
+            if not state["running"]:
+                break
+            time.sleep(1)
+
+    add_log("Bot oprit.", "warn")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# API
+# ──────────────────────────────────────────────────────────────────────────────
+@app.route("/")
+def index():
+    return send_from_directory("static", "index.html")
+
+
+@app.route("/api/status")
+def api_status():
+    total = state["wins"] + state["losses"]
+    open_pos = [p for p in state["positions"] if p.get("status") == "open"]
+    live_pnl = sum(p.get("pnl_live", 0) for p in open_pos)
+
+    return jsonify(
+        {
+            "running": state["running"],
+            "demo": T212_DEMO,
+            "balance": round(state["balance"], 2),
+            "pnl": round(state["pnl"], 2),
+            "live_pnl": round(live_pnl, 2),
+            "pnl_pct": round(state["pnl"] / max(start_balance, 1) * 100, 2),
+            "daily_dd": round(state["daily_dd"], 2),
+            "wins": state["wins"],
+            "losses": state["losses"],
+            "win_rate": round(state["wins"] / total * 100, 1) if total > 0 else 0,
+            "active_positions": len(open_pos),
+            "scan_count": state["scan_count"],
+            "last_scan": state["last_scan"],
+            "market": state["market"],
+            "regime": state["regime"],
+            "settings": settings,
+        }
+    )
+
+
+@app.route("/api/positions")
+def api_positions():
+    return jsonify(state["positions"])
+
+
+@app.route("/api/history")
+def api_history():
+    return jsonify(list(reversed(state["history"][-50:])))
+
+
+@app.route("/api/log")
+def api_log():
+    return jsonify(state["log"][:100])
+
+
+@app.route("/api/start", methods=["POST"])
+def api_start():
+    global bot_thread
+
+    if state["running"]:
+        return jsonify({"ok": False, "msg": "Bot deja pornit"})
+
+    if not T212_KEY or not T212_SECRET:
+        return jsonify({"ok": False, "msg": "T212_API_KEY sau T212_API_SECRET lipsa"})
+
+    if not ALPACA_KEY or not ALPACA_SECRET:
+        return jsonify({"ok": False, "msg": "ALPACA_KEY_ID sau ALPACA_SECRET_KEY lipsa"})
+
+    state["running"] = True
+    state["daily_dd"] = 0.0
+
+    bot_thread = threading.Thread(target=bot_loop, daemon=True)
+    bot_thread.start()
+
+    return jsonify({"ok": True})
+
+
+@app.route("/api/stop", methods=["POST"])
+def api_stop():
+    state["running"] = False
+    return jsonify({"ok": True})
+
+
+@app.route("/api/settings", methods=["POST"])
+def api_settings():
+    data = request.get_json() or {}
+
+    if "symbols" in data:
+        settings["symbols"] = normalize_symbols(data["symbols"])
+
+    if "risk_pct" in data:
+        settings["risk_pct"] = max(0.1, safe_float(data["risk_pct"], settings["risk_pct"]))
+
+    if "dd_limit" in data:
+        settings["dd_limit"] = max(0.5, safe_float(data["dd_limit"], settings["dd_limit"]))
+
+    if "sl_pct" in data:
+        settings["sl_pct"] = max(0.1, safe_float(data["sl_pct"], settings["sl_pct"]))
+
+    if "rr_ratio" in data:
+        settings["rr_ratio"] = max(0.5, safe_float(data["rr_ratio"], settings["rr_ratio"]))
+
+    if "max_positions" in data:
+        settings["max_positions"] = max(1, safe_int(data["max_positions"], settings["max_positions"]))
+
+    if "scan_interval" in data:
+        settings["scan_interval"] = max(5, safe_int(data["scan_interval"], settings["scan_interval"]))
+
+    add_log("Setari actualizate.", "info")
+    return jsonify({"ok": True, "settings": settings})
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
