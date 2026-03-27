@@ -248,22 +248,27 @@ def get_price(symbol):
 
 def get_bars(symbol, timeframe="1Hour", limit=80):
     if symbol not in US_SYMBOLS:
-        add_log(f"Bars {symbol}: simbol nesupported pe Alpaca IEX", "warn")
+        add_log(f"Bars {symbol}: simbol nesupported pe Alpaca", "warn")
         return []
-    try:
-        r = alpaca_session.get(
-            f"{ALPACA_DATA}/v2/stocks/{symbol}/bars",
-            headers=alpaca_headers(),
-            params={"timeframe": timeframe, "limit": limit,
-                    "feed": "iex", "adjustment": "raw"}, timeout=10)
-        r.raise_for_status()
-        raw = r.json().get("bars", [])
-        return [{"o": safe_float(b.get("o")), "h": safe_float(b.get("h")),
-                 "l": safe_float(b.get("l")), "c": safe_float(b.get("c")),
-                 "v": safe_int(b.get("v")), "t": b.get("t")} for b in raw if isinstance(b, dict)]
-    except Exception as e:
-        add_log(f"Bars {symbol}: {e}", "warn")
-        return []
+    # Incearca IEX mai intai, apoi fallback la SIP (delayed)
+    for feed in ["iex", "sip"]:
+        try:
+            r = alpaca_session.get(
+                f"{ALPACA_DATA}/v2/stocks/{symbol}/bars",
+                headers=alpaca_headers(),
+                params={"timeframe": timeframe, "limit": limit,
+                        "feed": feed, "adjustment": "raw"}, timeout=10)
+            r.raise_for_status()
+            raw = r.json().get("bars", [])
+            if raw:
+                bars = [{"o": safe_float(b.get("o")), "h": safe_float(b.get("h")),
+                         "l": safe_float(b.get("l")), "c": safe_float(b.get("c")),
+                         "v": safe_int(b.get("v")), "t": b.get("t")} for b in raw if isinstance(b, dict)]
+                if len(bars) >= 10:
+                    return bars
+        except Exception as e:
+            add_log(f"Bars {symbol} ({feed}): {e}", "warn")
+    return []
 
 def get_market_status():
     try:
@@ -338,13 +343,14 @@ def scan_symbol(symbol):
     """
     bars = get_bars(symbol, "1Hour", 60)
 
-    if len(bars) < 25:
+    if len(bars) < 15:
         add_log(f"{symbol}: date insuficiente ({len(bars)} bare)", "warn")
         return None
 
     closes = [b["c"] for b in bars]
     ema20  = calc_ema(closes[-20:], 20)
-    ema50  = calc_ema(closes[-50:], 50) if len(closes) >= 50 else calc_ema(closes, len(closes))
+    n50   = min(50, len(closes))
+    ema50  = calc_ema(closes[-n50:], n50)
     rsi    = calc_rsi(bars, 14)
     regime = detect_regime(bars)
     state["regime"] = regime
